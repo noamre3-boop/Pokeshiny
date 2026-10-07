@@ -2,12 +2,14 @@ name: Build Shiny Guard APK
 
 on:
   push:
-    branches:
-      - main
   workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: shiny-guard-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -19,15 +21,112 @@ jobs:
       - name: Download repository
         uses: actions/checkout@v4
 
-      - name: Check project files
+      - name: Find or extract Android project
         shell: bash
         run: |
           set -euo pipefail
 
-          test -f settings.gradle
-          test -f build.gradle
-          test -f app/build.gradle
-          test -f app/src/main/AndroidManifest.xml
+          python3 - <<'PY'
+          import os
+          import zipfile
+          from pathlib import Path
+
+          workspace = Path(os.environ["GITHUB_WORKSPACE"])
+          temporary = Path(os.environ["RUNNER_TEMP"]) / "shiny-guard-source"
+          temporary.mkdir(parents=True, exist_ok=True)
+
+          required = [
+              "settings.gradle",
+              "build.gradle",
+              "app/build.gradle",
+              "app/src/main/AndroidManifest.xml",
+              "app/src/main/java/com/noam/shinyguard/MainActivity.java",
+              "app/src/main/java/com/noam/shinyguard/GuardService.java",
+              "app/src/main/java/com/noam/shinyguard/Matcher.java",
+          ]
+
+          def find_project(directory):
+              candidates = sorted(
+                  directory.rglob("settings.gradle"),
+                  key=lambda p: len(p.parts),
+              )
+
+              for settings in candidates:
+                  if ".git" in settings.parts:
+                      continue
+
+                  project = settings.parent
+
+                  if all((project / name).is_file() for name in required):
+                      return project.resolve()
+
+              return None
+
+          project = find_project(workspace)
+
+          if project is None:
+              archives = sorted(
+                  workspace.rglob("ShinyGuard_Android_Project*.zip")
+              )
+
+              for index, archive in enumerate(archives):
+                  if ".git" in archive.parts:
+                      continue
+
+                  destination = temporary / str(index)
+                  destination.mkdir(parents=True, exist_ok=True)
+
+                  try:
+                      with zipfile.ZipFile(archive) as bundle:
+                          for item in bundle.infolist():
+                              output = (
+                                  destination / item.filename
+                              ).resolve()
+
+                              if not output.is_relative_to(
+                                  destination.resolve()
+                              ):
+                                  raise ValueError(
+                                      "Unsafe archive path"
+                                  )
+
+                          bundle.extractall(destination)
+
+                      project = find_project(destination)
+
+                      if project is not None:
+                          print("Extracted project from:", archive.name)
+                          break
+
+                  except (zipfile.BadZipFile, ValueError) as error:
+                      print("Archive rejected:", archive.name, error)
+
+          if project is None:
+              print(
+                  "::error::Android project not found. "
+                  "Upload ShinyGuard_Android_Project.zip "
+                  "or its extracted contents. "
+                  "The card-game ZIP is not this project."
+              )
+
+              print("Repository files:")
+              for item in sorted(workspace.rglob("*")):
+                  if item.is_file() and ".git" not in item.parts:
+                      print(item.relative_to(workspace))
+
+              raise SystemExit(1)
+
+          print("Android project:", project)
+
+          with open(
+              os.environ["GITHUB_ENV"],
+              "a",
+              encoding="utf-8",
+          ) as environment:
+              environment.write(
+                  "PROJECT_DIR=" + str(project) + "\n"
+              )
+          PY
 
       - name: Set up Java
         uses: actions/setup-java@v4
@@ -48,15 +147,23 @@ jobs:
           SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
 
           if [ ! -d "$SDK" ]; then
-            echo "::error::Android SDK directory not found"
+            echo "::error::Android SDK directory not found: $SDK"
             exit 1
           fi
 
           MANAGER="$SDK/cmdline-tools/latest/bin/sdkmanager"
 
           if [ ! -f "$MANAGER" ]; then
+            if [ ! -d "$SDK/cmdline-tools" ]; then
+              echo "::error::Android command-line tools not found"
+              exit 1
+            fi
+
             MANAGER="$(find "$SDK/cmdline-tools" \
-              -type f -name sdkmanager | sort | tail -n 1)"
+              -type f \
+              -name sdkmanager \
+              | sort \
+              | tail -n 1)"
           fi
 
           if [ -z "$MANAGER" ] || [ ! -f "$MANAGER" ]; then
@@ -67,7 +174,8 @@ jobs:
           echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
           echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
 
-          printf 'sdk.dir=%s\n' "$SDK" > local.properties
+          printf 'sdk.dir=%s\n' "$SDK" \
+            > "$PROJECT_DIR/local.properties"
 
           python3 - "$MANAGER" "$SDK" <<'PY'
           import subprocess
@@ -94,6 +202,7 @@ jobs:
             "build-tools;35.0.0"
 
       - name: Build debug APK
+        working-directory: ${{ env.PROJECT_DIR }}
         shell: bash
         run: |
           set -euo pipefail
@@ -108,12 +217,17 @@ jobs:
         run: |
           set -euo pipefail
 
-          mkdir -p output
+          APK="$PROJECT_DIR/app/build/outputs/apk/debug/app-debug.apk"
 
-          cp app/build/outputs/apk/debug/app-debug.apk \
-            output/ShinyGuard.apk
+          if [ ! -s "$APK" ]; then
+            echo "::error::Build did not produce app-debug.apk"
+            exit 1
+          fi
 
-          test -s output/ShinyGuard.apk
+          mkdir -p "$GITHUB_WORKSPACE/output"
+
+          cp "$APK" \
+            "$GITHUB_WORKSPACE/output/ShinyGuard.apk"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
@@ -122,4 +236,3 @@ jobs:
           path: output/ShinyGuard.apk
           if-no-files-found: error
           retention-days: 14
-          
